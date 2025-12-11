@@ -1,0 +1,11 @@
+# Web Framework
+fastapi>=0.109.0
+uvicorn[standard]
+python-multipart
+
+# AI & Vision
+ollama>=0.4.0
+
+# Utilities
+pydantic>=2.9.0
+python-dotenv
