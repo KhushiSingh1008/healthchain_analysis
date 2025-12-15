@@ -3,7 +3,10 @@ FastAPI application for medical report analysis using Vision LLM.
 """
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+import io
+import fitz  # PyMuPDF (Required for PDF handling)
 
+# Import your Vision service
 from app.services.llm import analyze_medical_image
 
 # Initialize FastAPI app
@@ -55,13 +58,7 @@ async def health_check():
 async def analyze_medical_report(file: UploadFile = File(...)):
     """
     Analyze a medical report using Vision LLM.
-    
-    This endpoint:
-    1. Reads the uploaded file
-    2. Sends it directly to Llama 3.2 Vision model
-    3. Returns extracted structured medical data
-    
-    No separate OCR step - the vision model handles everything!
+    Handles Images natively and converts PDFs to Images automatically.
     """
     # Validate file extension
     if not file.filename:
@@ -88,11 +85,31 @@ async def analyze_medical_report(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="Uploaded file is empty")
         
         print(f"Size: {len(file_bytes)} bytes")
+        
+        # --- 📄 PDF CONVERSION LOGIC (Added) ---
+        if file_ext == 'pdf':
+            print("📄 PDF detected. Converting first page to Image...")
+            try:
+                # Open PDF from bytes
+                doc = fitz.open(stream=file_bytes, filetype="pdf")
+                # Load first page
+                page = doc.load_page(0)
+                # Render to image (High DPI for better quality)
+                pix = page.get_pixmap(dpi=300)
+                # Convert back to bytes (PNG format)
+                file_bytes = pix.tobytes("png")
+                print("✅ PDF converted to PNG image successfully.")
+            except Exception as e:
+                print(f"❌ PDF Conversion Failed: {str(e)}")
+                raise HTTPException(status_code=400, detail="Failed to read PDF file. Please upload a valid Image.")
+        # ---------------------------------------
+
         print("="*60 + "\n")
         
         # Analyze with vision model
         print("🤖 SENDING TO LLAMA 3.2 VISION MODEL...\n")
         
+        # Now file_bytes is guaranteed to be an image (even if it started as PDF)
         result = analyze_medical_image(file_bytes)
         
         print("✅ VISION ANALYSIS COMPLETE!")
@@ -121,6 +138,6 @@ if __name__ == "__main__":
         "app.main:app",
         host="0.0.0.0",
         port=8000,
-        reload=False,
+        reload=False,  # Set to True if you want auto-reload during development
         log_level="info"
     )
