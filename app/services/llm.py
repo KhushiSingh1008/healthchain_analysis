@@ -7,7 +7,7 @@ import io
 import json
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 # Try importing ollama
 try:
@@ -27,37 +27,60 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# --- PROMPT ---
-VISION_PROMPT = """You are a medical data assistant. Analyze this image.
+VISION_PROMPT = """You are a medical data assistant analyzing medical laboratory reports.
 
-STEP 1: HEADER
-- Extract Patient Name and Date.
+Carefully examine this image and extract ALL test results into a structured JSON format.
 
-STEP 2: TEST EXTRACTION
-- Extract all tests.
+Your ENTIRE reply MUST be a SINGLE JSON object. Do NOT include:
+- Headings
+- Bullet points
+- Explanations
+- Markdown formatting
+- Any text before or after the JSON
 
-CRITICAL FORMATTING RULES (DO NOT IGNORE):
-1. NO COMMAS IN NUMBERS: Write 5100, NOT 5,100. (Remove all thousands separators).
-2. ALL VALUES MUST HAVE KEYS: Never write a standalone 'null'. It must be "reference_range": null.
-3. NO TRAILING COMMAS: Do not put a comma after the last item.
-4. JSON ONLY: No markdown, no comments.
+Your response MUST:
+- Start with '{'
+- End with '}'
+- Be directly parseable as JSON.
 
-Required JSON Structure:
+Required JSON structure:
 {
-  "report_type": "string",
-  "patient_name": "string or null",
-  "report_date": "string or null",
+  "report_type": "Type of report if visible (e.g. blood_test, urine_analysis, xray), otherwise null",
+  "patient_name": "Patient's name if visible, otherwise null",
+  "report_date": "Report date in YYYY-MM-DD format if visible, otherwise null",
   "tests": [
     {
-      "test_name": "string",
-      "value": "number or string (NO COMMAS)",
-      "unit": "string",
-      "reference_range": "string or null",
-      "status": "string or null"
+      "test_name": "Name of the medical test",
+      "value": "Test result value (no thousands separators, e.g. 5100 not 5,100)",
+      "unit": "Unit of measurement",
+      "reference_range": "Normal/reference range exactly as shown on the report, or null ONLY if truly not printed anywhere",
+      "status": "string or null (you may leave this null; it will be computed later)"
     }
   ]
 }
-"""
+
+CRITICAL INSTRUCTIONS (DO NOT IGNORE):
+1. Return ONLY valid JSON - no explanations, no markdown, no code blocks.
+2. Do NOT output section titles like '**Report Details**' or numbered/bulleted lists.
+3. Extract ALL tests visible in the image.
+4. If a field is not visible, use null.
+5. Preserve exact values and units as shown (except remove thousands separators in numbers).
+6. For tables, extract each row as a separate test.
+7. Double-check that your response is valid JSON and matches the structure above.
+8. For reference_range, always COPY the range from the report if present (including units and symbols).
+
+Now analyze the medical report image and return ONLY the JSON object, with no additional text."""
+
+CLINICAL_RISK_SYSTEM_PROMPT = """You are a Clinical Diagnostic Expert. Analyze the following lab results.
+
+Focus only on 'High' or 'Low' flagged values.
+
+Explain the physiological significance of these abnormalities.
+
+List 3-4 specific follow-up questions the patient should ask their doctor.
+
+Use professional but empathetic language. Include a medical disclaimer."""
+
 
 def _extract_json_from_response(text: str) -> Dict[str, Any]:
     """
@@ -96,6 +119,157 @@ def _extract_json_from_response(text: str) -> Dict[str, Any]:
             "raw_text": text[:100], # Send snippet for debugging
             "tests": []
         }
+
+
+def _parse_float(value: Any) -> Optional[float]:
+    """Best-effort conversion of a value (string/number) to float."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    cleaned = value.replace(",", " ").strip()
+    match = re.search(r"[-+]?\d*\.?\d+", cleaned)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def _parse_reference_range(range_str: str) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Parse a reference range string into numeric (low, high) bounds where possible.
+    Supports forms like:
+      - '13.5 - 17.5'
+      - '70–110 mg/dL'
+      - '< 150'
+      - '> 4.5'
+    Returns (low, high) where either side can be None if not applicable.
+    """
+    if not range_str or not isinstance(range_str, str):
+        return None, None
+
+    text = range_str.replace(",", " ").replace("–", "-")
+
+    # Case 1: interval "low - high"
+    interval_match = re.search(r"(-?\d*\.?\d+)\s*-\s*(-?\d*\.?\d+)", text)
+    if interval_match:
+        try:
+            low = float(interval_match.group(1))
+            high = float(interval_match.group(2))
+            return low, high
+        except ValueError:
+            return None, None
+
+    # Case 2: "<= x" or "< x"
+    upper_match = re.search(r"[<≤]\s*(-?\d*\.?\d+)", text)
+    if upper_match:
+        try:
+            high = float(upper_match.group(1))
+            return None, high
+        except ValueError:
+            return None, None
+
+    # Case 3: ">= x" or "> x"
+    lower_match = re.search(r"[>≥]\s*(-?\d*\.?\d+)", text)
+    if lower_match:
+        try:
+            low = float(lower_match.group(1))
+            return low, None
+        except ValueError:
+            return None, None
+
+    return None, None
+
+
+def flag_results(report: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Deterministically flag each test as 'Low', 'Normal', or 'High' based on reference_range.
+
+    - Parses numeric value from test["value"]
+    - Parses numeric bounds from test["reference_range"]
+    - Sets/overwrites test["status"] with one of: 'Low', 'Normal', 'High'
+      when both value and some bound(s) can be parsed.
+    - If parsing fails, leaves status unchanged.
+
+    Returns the same report dict (modified in place for convenience).
+    """
+    tests = report.get("tests", [])
+    if not isinstance(tests, list):
+        return report
+
+    for test in tests:
+        if not isinstance(test, dict):
+            continue
+
+        value_num = _parse_float(test.get("value"))
+        ref_range = test.get("reference_range")
+        if value_num is None or not ref_range:
+            # Cannot compute deterministic flag
+            continue
+
+        low, high = _parse_reference_range(ref_range)
+        status: Optional[str] = None
+
+        if low is not None and high is not None:
+            if value_num < low:
+                status = "Low"
+            elif value_num > high:
+                status = "High"
+            else:
+                status = "Normal"
+        elif low is not None:
+            # Only lower bound known (e.g. '> 4.5')
+            status = "Low" if value_num < low else "Normal"
+        elif high is not None:
+            # Only upper bound known (e.g. '< 150')
+            status = "High" if value_num > high else "Normal"
+
+        if status:
+            test["status"] = status
+
+    return report
+
+
+def run_clinical_risk_analysis(
+    flagged_report: Dict[str, Any],
+    model: str = "llama3.2",
+) -> str:
+    """
+    Call a text-only Llama 3.2 model to perform clinical risk reasoning
+    based on the deterministically flagged lab results.
+    """
+    if ollama is None:
+        raise Exception("ollama package not installed. Run: pip install ollama")
+
+    try:
+        payload = json.dumps(flagged_report, ensure_ascii=False)
+        response = ollama.chat(
+            model=model,
+            messages=[
+                {"role": "system", "content": CLINICAL_RISK_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        "Here are the lab results in JSON format. "
+                        "Focus your analysis only on tests with status 'High' or 'Low'.\n\n"
+                        f"{payload}"
+                    ),
+                },
+            ],
+            options={"temperature": 0.2},
+        )
+
+        if not response or "message" not in response:
+            raise ValueError("Invalid response from Ollama clinical model")
+
+        return response["message"]["content"]
+    except Exception as e:
+        logger.error(f"Clinical risk analysis failed: {str(e)}")
+        raise
 
 def analyze_medical_image(file_bytes: bytes, model: str = "llama3.2-vision") -> Dict[str, Any]:
     """

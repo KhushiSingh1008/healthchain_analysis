@@ -2,11 +2,18 @@
 FastAPI application for medical report analysis using Vision LLM.
 Supports multi-page PDFs and automatic report type segregation.
 """
+from typing import Any, List, Optional
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-# Import your Vision service
-from app.services.llm import analyze_medical_document
+# Import your Vision + risk analysis services
+from app.services.llm import (
+    analyze_medical_document,
+    flag_results,
+    run_clinical_risk_analysis,
+)
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -24,8 +31,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class TestResult(BaseModel):
+    test_name: str
+    value: Optional[float] = None
+    unit: Optional[str] = None
+    reference_range: Optional[str] = None
+    status: Optional[str] = None
+
+
+class RiskExtractedData(BaseModel):
+    report_type: Optional[str] = None
+    patient_name: Optional[str] = None
+    report_date: Optional[str] = None
+    page_numbers: List[int] = []
+    tests: List[TestResult]
+
+
+class RiskAnalysisResponse(BaseModel):
+    extracted_data: RiskExtractedData
+    clinical_analysis: Optional[str] = None
+    warning: Optional[str] = None
+
+
 # Allowed file extensions
-ALLOWED_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg', 'bmp', 'tiff', 'tif'}
+ALLOWED_EXTENSIONS = {"pdf", "png", "jpg", "jpeg", "bmp", "tiff", "tif"}
 
 
 @app.get("/")
@@ -82,14 +111,14 @@ async def analyze_medical_report(file: UploadFile = File(...)):
     if file_ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
+            detail=f"Invalid file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}",
         )
     
     try:
         # Read file bytes
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("🔍 STARTING VISION ANALYSIS")
-        print("="*60)
+        print("=" * 60)
         print(f"File: {file.filename}")
         print(f"Type: {file_ext.upper()}")
         
@@ -99,7 +128,7 @@ async def analyze_medical_report(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="Uploaded file is empty")
         
         print(f"Size: {len(file_bytes)} bytes")
-        print("="*60 + "\n")
+        print("=" * 60 + "\n")
         
         # Analyze with vision model (handles both images and PDFs)
         print("🤖 ANALYZING WITH LLAMA 3.2 VISION MODEL...\n")
@@ -113,7 +142,7 @@ async def analyze_medical_report(file: UploadFile = File(...)):
             test_count = len(report.get('tests', []))
             pages = report.get('page_numbers', [1])
             print(f"   Report {i}: {report_type} ({test_count} tests, pages: {pages})")
-        print("="*60 + "\n")
+        print("=" * 60 + "\n")
         
         # Return result
         # If single report, return it directly for backward compatibility
@@ -131,7 +160,7 @@ async def analyze_medical_report(file: UploadFile = File(...)):
                 "reports": results,
                 "summary": {
                     "total_reports": len(results),
-                    "report_types": [r.get('report_type') for r in results]
+                    "report_types": [r.get("report_type") for r in results],
                 }
             }
     
@@ -140,6 +169,125 @@ async def analyze_medical_report(file: UploadFile = File(...)):
     except Exception as e:
         print(f"\n❌ ERROR: {str(e)}\n")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    """Best-effort helper to convert extracted values into floats for the response model."""
+    try:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if not isinstance(value, str):
+            return None
+        cleaned = value.replace(",", " ").strip()
+        import re as _re
+
+        match = _re.search(r"[-+]?\d*\.?\d+", cleaned)
+        if not match:
+            return None
+        return float(match.group(0))
+    except Exception:
+        return None
+
+
+def _build_risk_extracted_data(report: dict) -> RiskExtractedData:
+    """Normalize a raw report dict from the vision pipeline into the RiskExtractedData schema."""
+    tests_raw = report.get("tests", []) or []
+    tests: List[TestResult] = []
+
+    for t in tests_raw:
+        if not isinstance(t, dict):
+            continue
+        tests.append(
+            TestResult(
+                test_name=t.get("test_name") or "",
+                value=_safe_float(t.get("value")),
+                unit=t.get("unit"),
+                reference_range=t.get("reference_range"),
+                status=t.get("status"),
+            )
+        )
+
+    return RiskExtractedData(
+        report_type=report.get("report_type"),
+        patient_name=report.get("patient_name"),
+        report_date=report.get("report_date"),
+        page_numbers=report.get("page_numbers") or [],
+        tests=tests,
+    )
+
+
+@app.post("/analyze/risk", response_model=RiskAnalysisResponse)
+async def analyze_clinical_risk(file: UploadFile = File(...)):
+    """
+    Single-report Clinical Risk Analysis.
+
+    Pipeline:
+    1) Vision extraction (existing v3.0 pipeline) to get structured tests
+    2) Deterministic flagging of each test as Low / Normal / High
+    3) Clinical reasoning via text-only Llama 3.2 model
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Filename is required")
+
+    file_ext = file.filename.lower().split(".")[-1] if "." in file.filename else ""
+    if file_ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}",
+        )
+
+    try:
+        file_bytes = await file.read()
+        if len(file_bytes) == 0:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+        # STEP A: Vision extraction (re-use existing multi-page logic)
+        reports = analyze_medical_document(file_bytes)
+        if not reports:
+            raise HTTPException(
+                status_code=500,
+                detail="Vision model returned no reports for this document",
+            )
+
+        # For clinical risk we focus on a single primary report (first one)
+        primary_report = reports[0]
+
+        # STEP B: Deterministic flagging
+        flagged_report = flag_results(primary_report)
+
+        # Build standardized extracted_data payload
+        extracted_data = _build_risk_extracted_data(flagged_report)
+
+        # STEP C: Clinical reasoning (best-effort; failure should not break extraction)
+        clinical_text: Optional[str] = None
+        warning: Optional[str] = None
+        try:
+            clinical_text = run_clinical_risk_analysis(
+                {
+                    "report_type": flagged_report.get("report_type"),
+                    "patient_name": flagged_report.get("patient_name"),
+                    "report_date": flagged_report.get("report_date"),
+                    "tests": flagged_report.get("tests", []),
+                }
+            )
+        except Exception as e:
+            warning = (
+                "Clinical reasoning step failed; returning extracted lab data only. "
+                f"Details: {str(e)}"
+            )
+
+        return RiskAnalysisResponse(
+            extracted_data=extracted_data,
+            clinical_analysis=clinical_text,
+            warning=warning,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Risk analysis failed: {str(e)}")
 
 
 if __name__ == "__main__":
