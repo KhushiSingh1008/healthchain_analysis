@@ -13,6 +13,7 @@ Pillow>=10.1.0
 # Utilities
 pydantic>=2.9.0
 python-dotenv
+dateparser>=1.2.0
 
 # Frontend / Dashboard
 streamlit>=1.40.0

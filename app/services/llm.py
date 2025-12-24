@@ -50,11 +50,11 @@ Required JSON structure:
   "report_date": "Report date in YYYY-MM-DD format if visible, otherwise null",
   "tests": [
     {
-      "test_name": "Name of the medical test",
+      "test_name": "Standardized formal medical test name (e.g. 'Hemoglobin' not 'Hb', 'Total Leukocyte Count' not 'WBC')",
       "value": "Test result value (no thousands separators, e.g. 5100 not 5,100)",
       "unit": "Unit of measurement",
       "reference_range": "Normal/reference range exactly as shown on the report, or null ONLY if truly not printed anywhere",
-      "status": "string or null (you may leave this null; it will be computed later)"
+      "status": "MUST be one of: 'Normal', 'High', or 'Low' based on comparing the value to the reference_range shown on the report. If the report explicitly marks it as abnormal/high/low, use that. Otherwise, compare value to reference_range and set accordingly."
     }
   ]
 }
@@ -68,6 +68,23 @@ CRITICAL INSTRUCTIONS (DO NOT IGNORE):
 6. For tables, extract each row as a separate test.
 7. Double-check that your response is valid JSON and matches the structure above.
 8. For reference_range, always COPY the range from the report if present (including units and symbols).
+9. STANDARDIZED TEST NAMES: Use formal medical terminology. Map abbreviations to full names:
+   - "Hb" or "HGB" → "Hemoglobin"
+   - "WBC" → "Total Leukocyte Count"
+   - "RBC" → "Red Blood Cell Count"
+   - "PLT" → "Platelet Count"
+   - "HCT" → "Hematocrit"
+   - "MCV" → "Mean Corpuscular Volume"
+   - "MCH" → "Mean Cell Hemoglobin"
+   - "MCHC" → "Mean Cell Hemoglobin Concentration"
+   - Use full formal names whenever possible.
+10. STATUS EXTRACTION: For EVERY test, you MUST set the "status" field to "Normal", "High", or "Low" by:
+    - Comparing the test value to the reference_range shown on the report
+    - If value is below the lower bound → "Low"
+    - If value is above the upper bound → "High"
+    - If value is within the range → "Normal"
+    - If the report explicitly marks it as abnormal, use that marking
+    - DO NOT leave status as null unless absolutely no reference_range exists
 
 Now analyze the medical report image and return ONLY the JSON object, with no additional text."""
 
@@ -188,27 +205,59 @@ def _parse_reference_range(range_str: str) -> Tuple[Optional[float], Optional[fl
 def flag_results(report: Dict[str, Any]) -> Dict[str, Any]:
     """
     Deterministically flag each test as 'Low', 'Normal', or 'High' based on reference_range.
+    Also applies standardization (test names, dates) and computes risk scores.
 
     - Parses numeric value from test["value"]
     - Parses numeric bounds from test["reference_range"]
     - Sets/overwrites test["status"] with one of: 'Low', 'Normal', 'High'
       when both value and some bound(s) can be parsed.
-    - If parsing fails, leaves status unchanged.
+    - Applies test name standardization
+    - Computes risk_score for each test
+    - Normalizes report_date to ISO format
 
     Returns the same report dict (modified in place for convenience).
     """
+    # Import utils here to avoid circular imports
+    from app.utils.medical_utils import (
+        normalize_date,
+        standardize_test_name,
+        get_risk_score,
+    )
+
+    # Normalize report date
+    if "report_date" in report:
+        normalized_date = normalize_date(report.get("report_date"))
+        if normalized_date:
+            report["standardized_date"] = normalized_date
+        else:
+            report["standardized_date"] = report.get("report_date")
+
     tests = report.get("tests", [])
     if not isinstance(tests, list):
         return report
+
+    risk_scores = []
 
     for test in tests:
         if not isinstance(test, dict):
             continue
 
+        # Standardize test name
+        original_name = test.get("test_name")
+        if original_name:
+            standardized_name = standardize_test_name(original_name)
+            test["standardized_test_name"] = standardized_name
+            # Also update the original field for backward compatibility
+            test["test_name"] = standardized_name
+
         value_num = _parse_float(test.get("value"))
         ref_range = test.get("reference_range")
         if value_num is None or not ref_range:
-            # Cannot compute deterministic flag
+            # Cannot compute deterministic flag, but still compute risk score
+            status = test.get("status")
+            risk_score = get_risk_score(status)
+            test["risk_score"] = risk_score
+            risk_scores.append(risk_score)
             continue
 
         low, high = _parse_reference_range(ref_range)
@@ -230,6 +279,17 @@ def flag_results(report: Dict[str, Any]) -> Dict[str, Any]:
 
         if status:
             test["status"] = status
+
+        # Compute risk score
+        risk_score = get_risk_score(status)
+        test["risk_score"] = risk_score
+        risk_scores.append(risk_score)
+
+    # Compute average risk score for the report
+    if risk_scores:
+        report["risk_score_avg"] = sum(risk_scores) / len(risk_scores)
+    else:
+        report["risk_score_avg"] = 0.0
 
     return report
 
@@ -288,7 +348,10 @@ def analyze_medical_image(file_bytes: bytes, model: str = "llama3.2-vision") -> 
         response = ollama.chat(
             model=model,
             messages=[{'role': 'user', 'content': VISION_PROMPT, 'images': [base64_image]}],
-            options={'temperature': 0}
+            options={
+                'temperature': 0.1,  # Slightly higher than 0 for deterministic but flexible JSON
+                'num_predict': 2048  # Ensure JSON isn't cut off mid-response
+            }
         )
         
         if not response or 'message' not in response:

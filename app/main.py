@@ -33,18 +33,22 @@ app.add_middleware(
 
 class TestResult(BaseModel):
     test_name: str
+    standardized_test_name: Optional[str] = None
     value: Optional[float] = None
     unit: Optional[str] = None
     reference_range: Optional[str] = None
     status: Optional[str] = None
+    risk_score: Optional[int] = None
 
 
 class RiskExtractedData(BaseModel):
     report_type: Optional[str] = None
     patient_name: Optional[str] = None
     report_date: Optional[str] = None
+    standardized_date: Optional[str] = None
     page_numbers: List[int] = []
     tests: List[TestResult]
+    risk_score_avg: Optional[float] = None
 
 
 class RiskAnalysisResponse(BaseModel):
@@ -202,10 +206,12 @@ def _build_risk_extracted_data(report: dict) -> RiskExtractedData:
         tests.append(
             TestResult(
                 test_name=t.get("test_name") or "",
+                standardized_test_name=t.get("standardized_test_name"),
                 value=_safe_float(t.get("value")),
                 unit=t.get("unit"),
                 reference_range=t.get("reference_range"),
                 status=t.get("status"),
+                risk_score=t.get("risk_score"),
             )
         )
 
@@ -213,8 +219,10 @@ def _build_risk_extracted_data(report: dict) -> RiskExtractedData:
         report_type=report.get("report_type"),
         patient_name=report.get("patient_name"),
         report_date=report.get("report_date"),
+        standardized_date=report.get("standardized_date"),
         page_numbers=report.get("page_numbers") or [],
         tests=tests,
+        risk_score_avg=report.get("risk_score_avg"),
     )
 
 
