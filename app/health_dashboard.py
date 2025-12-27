@@ -283,7 +283,11 @@ def main() -> None:
         files = {"file": (uploaded.name, uploaded.getvalue(), uploaded.type)}
         
         try:
-            status_text.info("🤖 Step 1/3: Extracting data with Vision model (this may take 1-5 minutes for large PDFs)...")
+            status_text.info("🤖 Step 1/3: Extracting data with Vision model...")
+            # For multipage PDFs, this may take longer
+            is_pdf = uploaded.name.lower().endswith('.pdf')
+            if is_pdf:
+                status_text.info("🤖 Step 1/3: Processing multipage PDF with Vision model (this may take 1-5 minutes)...")
             progress_bar.progress(30)
             
             # Make request with increased timeout

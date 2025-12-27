@@ -259,8 +259,33 @@ async def analyze_clinical_risk(file: UploadFile = File(...)):
                 detail="Vision model returned no reports for this document",
             )
 
-        # For clinical risk we focus on a single primary report (first one)
-        primary_report = reports[0]
+        # Filter out error pages
+        valid_reports = [r for r in reports if 'error' not in r]
+        if not valid_reports:
+            raise HTTPException(
+                status_code=500,
+                detail="All pages failed to process. Please check the PDF quality.",
+            )
+
+        # For multipage PDFs: merge all tests from all valid reports into one
+        if len(valid_reports) > 1:
+            primary_report = {
+                'report_type': valid_reports[0].get('report_type') or 'Multipage Report',
+                'patient_name': next((r.get('patient_name') for r in valid_reports if r.get('patient_name')), None),
+                'report_date': next((r.get('report_date') for r in valid_reports if r.get('report_date')), None),
+                'tests': [],
+                'page_numbers': []
+            }
+            
+            # Merge all tests from all pages
+            for report in valid_reports:
+                primary_report['tests'].extend(report.get('tests', []))
+                if 'page_numbers' in report:
+                    primary_report['page_numbers'].extend(report['page_numbers'])
+                elif 'page_number' in report:
+                    primary_report['page_numbers'].append(report['page_number'])
+        else:
+            primary_report = valid_reports[0]
 
         # STEP B: Deterministic flagging
         flagged_report = flag_results(primary_report)

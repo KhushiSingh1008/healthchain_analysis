@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 VISION_PROMPT = """You are a medical data assistant analyzing medical laboratory reports.
 
 Carefully examine this image and extract ALL test results into a structured JSON format.
+Look closely at the top and bottom of the page for Patient Name and Report Date.
 
 Your ENTIRE reply MUST be a SINGLE JSON object. Do NOT include:
 - Headings
@@ -50,41 +51,63 @@ Required JSON structure:
   "report_date": "Report date in YYYY-MM-DD format if visible, otherwise null",
   "tests": [
     {
-      "test_name": "Standardized formal medical test name (e.g. 'Hemoglobin' not 'Hb', 'Total Leukocyte Count' not 'WBC')",
-      "value": "Test result value (no thousands separators, e.g. 5100 not 5,100)",
-      "unit": "Unit of measurement",
+      "test_name": "EXACT test name as printed (e.g. 'HBsAg Screening' NOT 'Hemoglobin', 'HIV I & II' NOT 'HIV Test')",
+      "value": "Primary result value - for qualitative tests (Non-Reactive/Reactive/Positive/Negative), use the TEXT result NOT the numeric ratio",
+      "unit": "Unit of measurement if any, otherwise null",
       "reference_range": "Normal/reference range exactly as shown on the report, or null ONLY if truly not printed anywhere",
-      "status": "MUST be one of: 'Normal', 'High', or 'Low' based on comparing the value to the reference_range shown on the report. If the report explicitly marks it as abnormal/high/low, use that. Otherwise, compare value to reference_range and set accordingly."
+      "status": "MUST be one of: 'Normal', 'High', or 'Low' based on comparing the value to the reference_range. For qualitative tests, 'Non-Reactive' or 'Negative' = 'Normal', 'Reactive' or 'Positive' = 'High'"
     }
   ]
 }
 
-CRITICAL INSTRUCTIONS (DO NOT IGNORE):
-1. Return ONLY valid JSON - no explanations, no markdown, no code blocks.
-2. Do NOT output section titles like '**Report Details**' or numbered/bulleted lists.
-3. Extract ALL tests visible in the image.
-4. If a field is not visible, use null.
-5. Preserve exact values and units as shown (except remove thousands separators in numbers).
-6. For tables, extract each row as a separate test.
-7. Double-check that your response is valid JSON and matches the structure above.
-8. For reference_range, always COPY the range from the report if present (including units and symbols).
-9. STANDARDIZED TEST NAMES: Use formal medical terminology. Map abbreviations to full names:
-   - "Hb" or "HGB" → "Hemoglobin"
+CRITICAL ANTI-HALLUCINATION RULES (STRICTLY ENFORCE):
+1. TRANSCRIBE TEST NAMES EXACTLY: Copy the test name character-by-character from the report. DO NOT:
+   - Autocomplete abbreviations (e.g., "HBsAg" must NOT become "Hemoglobin")
+   - Replace names with synonyms (e.g., keep "HBsAg Screening" not "Hepatitis B Surface Antigen")
+   - Guess or infer test names
+   - CONFUSE "HBsAg" (Hepatitis B) with "Hb" (Hemoglobin). They are completely different tests.
+   
+2. IGNORE SECTION HEADERS: Section headers like "Thyroid Antibodies-TPO and ATG" or "HEMATOLOGY" are NOT test results. Only extract rows that have:
+   - A specific test name in the left column
+   - A corresponding result value in the result column
+   - DO NOT extract headers, category labels, or page footers
+   
+3. QUALITATIVE TESTS (HIV/HCV/HBsAg/RPR/VDRL/Pregnancy): For these tests:
+   - PRIMARY VALUE: Use the TEXT result (e.g., "Non-Reactive", "Reactive", "Positive", "Negative")
+   - IGNORE numeric ratios like "S/CO: 0.2" - these are NOT the result
+   - The text interpretation is the authoritative result
+   
+4. QUANTITATIVE TESTS (Hemoglobin/WBC/Glucose/etc.): 
+   - Extract the NUMERIC value (e.g., "13.5", "5100")
+   - Remove thousands separators (5,100 → 5100)
+   - Include the unit (e.g., "g/dL", "cells/µL")
+   
+5. Return ONLY valid JSON - no explanations, no markdown, no code blocks.
+
+6. Extract ALL visible test results on this page - do not stop early. Scan the entire image.
+
+7. For reference_range, COPY the exact range from the report (including units and symbols).
+
+8. STANDARDIZED TEST NAMES: Only standardize COMMON abbreviations when the full name is clear:
+   - "Hb" → "Hemoglobin" (ONLY if it says "Hb" not "HBsAg")
    - "WBC" → "Total Leukocyte Count"
    - "RBC" → "Red Blood Cell Count"
    - "PLT" → "Platelet Count"
-   - "HCT" → "Hematocrit"
-   - "MCV" → "Mean Corpuscular Volume"
-   - "MCH" → "Mean Cell Hemoglobin"
-   - "MCHC" → "Mean Cell Hemoglobin Concentration"
-   - Use full formal names whenever possible.
-10. STATUS EXTRACTION: For EVERY test, you MUST set the "status" field to "Normal", "High", or "Low" by:
-    - Comparing the test value to the reference_range shown on the report
-    - If value is below the lower bound → "Low"
-    - If value is above the upper bound → "High"
-    - If value is within the range → "Normal"
-    - If the report explicitly marks it as abnormal, use that marking
-    - DO NOT leave status as null unless absolutely no reference_range exists
+   - For specialized tests (HBsAg, HIV, HCV, RPR, VDRL), keep the EXACT name from the report
+
+9. STATUS EXTRACTION: 
+   - For QUANTITATIVE tests: Compare value to reference_range
+     * If value < lower bound → "Low"
+     * If value > upper bound → "High"
+     * If value within range → "Normal"
+     
+10. MISSING INFO: If Patient Name or Date is not clearly labeled, look for text like "Name:", "Patient:", "Date:", "Reported:", "Collected:".
+   - For QUALITATIVE tests:
+     * "Non-Reactive", "Negative", "Normal" → "Normal"
+     * "Reactive", "Positive", "Abnormal" → "High"
+   - If the report explicitly marks it as abnormal/high/low, use that marking
+
+10. Double-check your JSON is valid and matches the structure above.
 
 Now analyze the medical report image and return ONLY the JSON object, with no additional text."""
 
@@ -104,6 +127,8 @@ def _extract_json_from_response(text: str) -> Dict[str, Any]:
     Extract and parse JSON from model response.
     Includes a "NUCLEAR" CLEANER to fix trailing commas, comments, and markdown.
     """
+    original_text = text  # Keep for debugging
+    
     try:
         # 1. Remove Markdown Code Blocks (```json ... ```)
         text = re.sub(r'```json\s*', '', text)
@@ -111,9 +136,17 @@ def _extract_json_from_response(text: str) -> Dict[str, Any]:
 
         # 2. Isolate the JSON block
         start_index = text.find('{')
+        # Use rfind to find the last '}', but if it's missing (truncation), use the end of string
         end_index = text.rfind('}')
         
-        if start_index != -1 and end_index != -1:
+        if start_index == -1:
+            logger.error("No JSON start brace found in response")
+            raise json.JSONDecodeError("No JSON found", text, 0)
+            
+        if end_index == -1:
+            # Truncated response? Use end of string
+            text = text[start_index:]
+        else:
             text = text[start_index : end_index + 1]
 
         # 3. Remove Comments (// ... or # ...)
@@ -124,16 +157,90 @@ def _extract_json_from_response(text: str) -> Dict[str, Any]:
         # Replaces ", }" with "}" and ", ]" with "]"
         text = re.sub(r',\s*([\]}])', r'\1', text)
 
-        return json.loads(text)
+        # 5. Attempt to parse
+        parsed = json.loads(text)
+        
+        # 6. Validate the structure
+        if not isinstance(parsed, dict):
+            raise ValueError("Response is not a JSON object")
+            
+        # Ensure tests is a list
+        if 'tests' in parsed and not isinstance(parsed['tests'], list):
+            parsed['tests'] = []
+            
+        return parsed
             
     except json.JSONDecodeError as e:
-        logger.error(f"JSON Parsing Failed. Raw text:\n{text}")
-        # Return a partial error object instead of crashing
+        logger.error(f"JSON Parsing Failed at position {e.pos}")
+        logger.error(f"Cleaned text:\n{text[:500]}")
+        
+        # Attempt to repair truncated JSON
+        try:
+            logger.info("Attempting to repair truncated JSON...")
+            repaired_text = text.strip()
+            
+            # 1. Remove last comma if present
+            if repaired_text.endswith(','):
+                repaired_text = repaired_text[:-1]
+                
+            # 2. Close unclosed strings
+            if repaired_text.count('"') % 2 != 0:
+                repaired_text += '"'
+                
+            # 3. Balance brackets/braces
+            # Simple heuristic: append missing closing brackets
+            # Note: This assumes standard nesting order (tests -> test object)
+            open_brackets = repaired_text.count('[')
+            close_brackets = repaired_text.count(']')
+            open_braces = repaired_text.count('{')
+            close_braces = repaired_text.count('}')
+            
+            # Append needed closing characters
+            # Usually we need to close objects first, then arrays, then main object
+            # But since we don't track the stack, we'll try a common pattern
+            
+            # If we are inside a test object (more { than }), close it
+            if open_braces > close_braces:
+                repaired_text += '}' * (open_braces - close_braces)
+                
+            # If we are inside the tests array (more [ than ]), close it
+            if open_brackets > close_brackets:
+                repaired_text += ']' * (open_brackets - close_brackets)
+                
+            # If we still have unclosed main object (which we might have closed above if it was the only one)
+            # Let's re-check
+            final_open_braces = repaired_text.count('{')
+            final_close_braces = repaired_text.count('}')
+            if final_open_braces > final_close_braces:
+                repaired_text += '}' * (final_open_braces - final_close_braces)
+
+            parsed = json.loads(repaired_text)
+            logger.info("Successfully repaired truncated JSON")
+            
+            if isinstance(parsed, dict):
+                if 'tests' in parsed and not isinstance(parsed['tests'], list):
+                    parsed['tests'] = []
+                return parsed
+                
+        except Exception as repair_error:
+            logger.warning(f"JSON repair failed: {repair_error}")
+
+        # Return a structured error instead of crashing
         return {
-            "report_type": "Error",
+            "report_type": "JSON Parse Error",
             "patient_name": None,
-            "error": "JSON Parsing Failed",
-            "raw_text": text[:100], # Send snippet for debugging
+            "report_date": None,
+            "error": f"JSON Parsing Failed: {str(e)}",
+            "raw_snippet": text[:200],
+            "tests": []
+        }
+    except Exception as e:
+        logger.error(f"Unexpected error during JSON extraction: {str(e)}")
+        return {
+            "report_type": "Extraction Error",
+            "patient_name": None,
+            "report_date": None,
+            "error": str(e),
             "tests": []
         }
 
@@ -334,6 +441,7 @@ def run_clinical_risk_analysis(
 def analyze_medical_image(file_bytes: bytes, model: str = "llama3.2-vision") -> Dict[str, Any]:
     """
     Analyze a single image using Llama 3.2 Vision model.
+    Uses strict temperature settings to reduce hallucination.
     """
     if ollama is None:
         raise Exception("ollama package not installed. Run: pip install ollama")
@@ -347,10 +455,17 @@ def analyze_medical_image(file_bytes: bytes, model: str = "llama3.2-vision") -> 
         
         response = ollama.chat(
             model=model,
-            messages=[{'role': 'user', 'content': VISION_PROMPT, 'images': [base64_image]}],
+            messages=[{
+                'role': 'user', 
+                'content': VISION_PROMPT, 
+                'images': [base64_image]
+            }],
             options={
-                'temperature': 0.1,  # Slightly higher than 0 for deterministic but flexible JSON
-                'num_predict': 2048  # Ensure JSON isn't cut off mid-response
+                'temperature': 0.0,  # Zero temperature for maximum determinism and accuracy
+                'num_ctx': 8192,      # CRITICAL: Increase context window (default is 2048, which is too small for images)
+                'num_predict': 4096,  # Max tokens to generate
+                'top_p': 0.9,  # Nucleus sampling for consistency
+                'repeat_penalty': 1.1  # Prevent repetitive hallucinations
             }
         )
         
@@ -358,7 +473,15 @@ def analyze_medical_image(file_bytes: bytes, model: str = "llama3.2-vision") -> 
             raise ValueError("Invalid response from Ollama")
         
         response_text = response['message']['content']
-        return _extract_json_from_response(response_text)
+        logger.debug(f"Raw vision response (first 300 chars): {response_text[:300]}")
+        
+        extracted = _extract_json_from_response(response_text)
+        
+        # Validation: warn if no tests found
+        if not extracted.get('tests') or len(extracted.get('tests', [])) == 0:
+            logger.warning("Vision model returned zero tests - possible empty page or parsing failure")
+        
+        return extracted
         
     except Exception as e:
         logger.error(f"Error during vision analysis: {str(e)}")
@@ -389,6 +512,7 @@ def _convert_pdf_to_images(file_bytes: bytes) -> List[bytes]:
 def _segregate_reports_by_type(page_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Groups pages by report type and merges them.
+    Filters out empty or error pages.
     """
     from collections import defaultdict
     grouped = defaultdict(list)
@@ -397,10 +521,17 @@ def _segregate_reports_by_type(page_results: List[Dict[str, Any]]) -> List[Dict[
         # If the page failed, group it under "Error"
         if 'error' in page:
             grouped[f"error_{page.get('page_number')}"].append(page)
+        # Skip pages with no tests (empty or non-medical pages)
+        elif not page.get('tests') or len(page.get('tests', [])) == 0:
+            logger.warning(f"Page {page.get('page_number', '?')} has no tests, skipping")
+            continue
         else:
             # Handle cases where report_type might be messy
             rtype = page.get('report_type', 'Unknown')
-            if not isinstance(rtype, str): rtype = 'Unknown'
+            if not isinstance(rtype, str): 
+                rtype = 'Unknown'
+            # Normalize report type to avoid fragmentation
+            rtype = rtype.strip().lower()
             grouped[rtype].append(page)
     
     merged_reports = []
@@ -410,7 +541,7 @@ def _segregate_reports_by_type(page_results: List[Dict[str, Any]]) -> List[Dict[
             continue
             
         merged = {
-            'report_type': rtype,
+            'report_type': rtype.title() if rtype != 'unknown' else 'Medical Report',
             # Find the first non-null patient name in the group
             'patient_name': next((p.get('patient_name') for p in pages if p.get('patient_name')), None),
             'report_date': next((p.get('report_date') for p in pages if p.get('report_date')), None),
@@ -432,6 +563,7 @@ def _segregate_reports_by_type(page_results: List[Dict[str, Any]]) -> List[Dict[
 def analyze_medical_document(file_bytes: bytes, model: str = "llama3.2-vision") -> List[Dict[str, Any]]:
     """
     Analyze a document (PDF or Image) and return a list of segregated reports.
+    ENSURES ALL PAGES ARE PROCESSED - errors on individual pages won't stop processing.
     """
     if not file_bytes:
         raise ValueError("Empty file")
@@ -441,18 +573,54 @@ def analyze_medical_document(file_bytes: bytes, model: str = "llama3.2-vision") 
     if is_pdf:
         logger.info("Processing PDF...")
         page_images = _convert_pdf_to_images(file_bytes)
-        results = []
-        for i, img_bytes in enumerate(page_images):
-            try:
-                res = analyze_medical_image(img_bytes, model)
-                res['page_number'] = i + 1
-                results.append(res)
-            except Exception as e:
-                logger.error(f"Page {i+1} failed: {e}")
-                results.append({'error': str(e), 'page_number': i+1})
+        total_pages = len(page_images)
+        logger.info(f"PDF converted to {total_pages} pages")
         
+        results = []
+        failed_pages = []
+        
+        for i, img_bytes in enumerate(page_images):
+            page_num = i + 1
+            try:
+                logger.info(f"Processing page {page_num}/{total_pages}...")
+                res = analyze_medical_image(img_bytes, model)
+                res['page_number'] = page_num
+                
+                # Validate that the page has tests
+                if res.get('tests') and len(res.get('tests', [])) > 0:
+                    logger.info(f"✓ Page {page_num}: Found {len(res.get('tests', []))} tests")
+                    results.append(res)
+                else:
+                    logger.warning(f"⚠ Page {page_num}: No tests found (might be a cover page or blank)")
+                    # Still append it but mark it
+                    res['warning'] = 'No tests found on this page'
+                    results.append(res)
+                    
+            except Exception as e:
+                # Log the error but DON'T stop processing other pages
+                logger.error(f"❌ Page {page_num} failed: {e}")
+                failed_pages.append(page_num)
+                results.append({
+                    'error': str(e), 
+                    'page_number': page_num,
+                    'tests': []
+                })
+        
+        # Log final summary
+        successful_pages = total_pages - len(failed_pages)
+        logger.info(f"\n{'='*60}")
+        logger.info(f"PDF Processing Complete:")
+        logger.info(f"  Total Pages: {total_pages}")
+        logger.info(f"  Successful: {successful_pages}")
+        logger.info(f"  Failed: {len(failed_pages)}")
+        if failed_pages:
+            logger.warning(f"  Failed page numbers: {failed_pages}")
+        logger.info(f"{'='*60}\n")
+        
+        # Return all results (including errors) - segregation will filter them
         return _segregate_reports_by_type(results)
     else:
         logger.info("Processing single image...")
         res = analyze_medical_image(file_bytes, model)
+        res['page_number'] = 1
         return [res]

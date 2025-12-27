@@ -178,8 +178,18 @@ def standardize_test_name(test_name: Optional[str]) -> str:
         return TEST_SYNONYMS[test_name_lower]
     
     # Check for partial matches (e.g., "Hb" in "Hb (Hemoglobin)")
+    # Use word boundaries to avoid false positives (e.g. "Hb" matching "HBsAg")
+    import re
     for key, standardized in TEST_SYNONYMS.items():
-        if key in test_name_lower or test_name_lower in key:
+        # Escape key for regex
+        key_esc = re.escape(key)
+        # Check if key appears as a whole word in test_name_lower
+        if re.search(r'\b' + key_esc + r'\b', test_name_lower):
+            return standardized
+        # Also check if test_name_lower appears in key (reverse match)
+        # e.g. "leukocyte count" input matching "total leukocyte count" key
+        # But ensure input is not too short to avoid false positives
+        if len(test_name_lower) > 3 and test_name_lower in key:
             return standardized
     
     # No match found, return original (capitalized)
